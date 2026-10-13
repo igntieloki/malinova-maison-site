@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Malinova Maison : décoration, rangement et accessoires pratiques pour un intérieur qui vous ressemble.">
+  <title>{% block title %}Malinova Maison — le beau côté pratique{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="announcement">Des idées simples pour un intérieur qui vous ressemble</div>
+<header class="site-header"><div class="container nav">
+  <a class="brand" href="{{ url_for('index') }}">Malinova <span>Maison</span></a>
+  <nav class="navlinks" aria-label="Navigation principale">
+    <a href="{{ url_for('index') }}">Accueil</a><a href="{{ url_for('shop') }}">Boutique</a><a href="{{ url_for('about') }}">Notre histoire</a><a href="{{ url_for('contact') }}">Contact</a><a class="cart-link" href="{{ url_for('cart') }}">Panier ({{ cart_count }})</a>
+  </nav>
+</div></header>
+<main>
+<div class="container">
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, message in messages %}<div class="notice {{ 'error' if category == 'error' else '' }}">{{ message }}</div>{% endfor %}
+{% endwith %}
+</div>
+{% block content %}{% endblock %}
+</main>
+<footer class="site-footer"><div class="container">
+  <div class="footer-grid">
+    <div><a class="brand" href="{{ url_for('index') }}" style="color:#fff">Malinova <span>Maison</span></a><p>Des objets choisis pour rendre la maison plus belle, plus pratique et plus agréable à vivre.</p></div>
+    <div><h3>La boutique</h3><p><a href="{{ url_for('shop') }}">Tous les produits</a></p><p><a href="{{ url_for('about') }}">À propos</a></p></div>
+    <div><h3>Besoin d’aide ?</h3><p><a href="{{ url_for('contact') }}">Nous contacter</a></p><p><a href="{{ url_for('legal') }}">Mentions légales</a></p><p><a href="{{ url_for('admin_login') }}">Administration</a></p></div>
+  </div><div class="footer-bottom">© {{ current_year }} Malinova Maison — Site de démonstration à personnaliser avant toute vente réelle.</div>
+</div></footer>
+</body></html>
