@@ -2,6 +2,7 @@ import os
 import sqlite3
 import secrets
 import json
+import stripe
 from functools import wraps
 from datetime import datetime
 from flask import (
@@ -27,6 +28,7 @@ app.config.update(
 )
 
 ADMIN_PASSWORD = os.environ.get("MALINOVA_ADMIN_PASSWORD", "")
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 CATEGORIES = ["Décoration", "Rangement", "Cuisine", "Textiles"]
 
 SEED_PRODUCTS = [
