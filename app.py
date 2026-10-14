@@ -2,19 +2,24 @@ import os
 import sqlite3
 import secrets
 import json
-import stripe
 from functools import wraps
 from datetime import datetime
+
+import stripe
 from flask import (
     Flask, render_template, request, redirect, url_for,
     session, flash, abort, g
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.environ.get("MALINOVA_DB_PATH", os.path.join(BASE_DIR, "malinova.db"))
 
 app = Flask(__name__)
+# Render est derrière un proxy HTTPS : on lui fait confiance pour construire les bonnes URLs.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
 app.secret_key = os.environ.get("MALINOVA_SECRET_KEY")
 if not app.secret_key:
     # Convenience for local testing only. Set MALINOVA_SECRET_KEY in Render before public use.
@@ -28,7 +33,20 @@ app.config.update(
 )
 
 ADMIN_PASSWORD = os.environ.get("MALINOVA_ADMIN_PASSWORD", "")
+
+# ---------------------------------------------------------------------------
+# Stripe
+# ---------------------------------------------------------------------------
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+# Sécurité : les vraies clés (sk_live_...) sont refusées tant que cette variable n'est pas à "1".
+ALLOW_LIVE_PAYMENTS = os.environ.get("ALLOW_LIVE_PAYMENTS", "0") == "1"
+
+STATUS_PENDING = "En attente de paiement"
+STATUS_PAID = "Payée"
+STATUS_SHIPPED = "Expédiée"
+STATUS_CANCELLED = "Annulée"
+
 CATEGORIES = ["Décoration", "Rangement", "Cuisine", "Textiles"]
 
 SEED_PRODUCTS = [
@@ -43,6 +61,24 @@ SEED_PRODUCTS = [
 app.jinja_env.filters['from_json'] = lambda value: json.loads(value or '[]')
 
 
+def to_cents(amount):
+    """Convertit un prix en euros en centimes (entier), comme l'exige Stripe."""
+    return int(round(float(amount) * 100))
+
+
+def stripe_ready():
+    """Vérifie que la clé Stripe est présente et autorisée. Retourne (ok, message)."""
+    key = stripe.api_key or ""
+    if not key.startswith(("sk_test_", "sk_live_", "rk_test_", "rk_live_")):
+        return False, "Le paiement n'est pas encore configuré sur ce site."
+    if key.startswith(("sk_live_", "rk_live_")) and not ALLOW_LIVE_PAYMENTS:
+        return False, "Les paiements réels ne sont pas encore activés sur ce site."
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Base de données
+# ---------------------------------------------------------------------------
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
@@ -91,12 +127,16 @@ def init_db():
         total REAL NOT NULL,
         status TEXT NOT NULL DEFAULT 'À traiter',
         created_at TEXT NOT NULL,
+        stripe_session_id TEXT,
         FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE SET NULL
     )""")
-    # Ensure an existing database from the previous version gains the customer_id column.
+    # Migrations pour une base créée par une version précédente.
     order_columns = {row[1] for row in db.execute("PRAGMA table_info(orders)").fetchall()}
     if "customer_id" not in order_columns:
         db.execute("ALTER TABLE orders ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
+    if "stripe_session_id" not in order_columns:
+        db.execute("ALTER TABLE orders ADD COLUMN stripe_session_id TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_orders_stripe_session ON orders(stripe_session_id)")
     count = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
     if count == 0:
         db.executemany(
@@ -108,6 +148,10 @@ def init_db():
 
 init_db()
 
+
+# ---------------------------------------------------------------------------
+# Accès
+# ---------------------------------------------------------------------------
 def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -125,9 +169,13 @@ def customer_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+
+# ---------------------------------------------------------------------------
+# Panier (les prix viennent TOUJOURS de la base de données, jamais du navigateur)
+# ---------------------------------------------------------------------------
 def cart_details():
     cart = session.get("cart", {})
-    ids = [int(k) for k, qty in cart.items() if str(qty).isdigit() and int(qty) > 0]
+    ids = [int(k) for k, qty in cart.items() if str(k).isdigit() and str(qty).isdigit() and int(qty) > 0]
     if not ids:
         return [], 0.0, 0
     placeholders = ",".join("?" for _ in ids)
@@ -155,6 +203,10 @@ def inject_globals():
         "is_admin": bool(session.get("is_admin")),
     }
 
+
+# ---------------------------------------------------------------------------
+# Pages boutique
+# ---------------------------------------------------------------------------
 @app.route("/")
 def index():
     products = get_db().execute(
@@ -221,6 +273,10 @@ def update_cart():
     flash("Panier mis à jour.", "success")
     return redirect(url_for("cart"))
 
+
+# ---------------------------------------------------------------------------
+# Comptes clients
+# ---------------------------------------------------------------------------
 @app.route("/inscription", methods=["GET", "POST"])
 def register():
     if session.get("customer_id"):
@@ -299,6 +355,51 @@ def account():
     ).fetchall()
     return render_template("account.html", customer=customer, orders=orders)
 
+
+# ---------------------------------------------------------------------------
+# Commande + paiement Stripe Checkout
+# ---------------------------------------------------------------------------
+def cancel_pending_order(order_id):
+    """Annule une commande uniquement si elle attend encore son paiement."""
+    if not order_id:
+        return
+    db = get_db()
+    db.execute(
+        "UPDATE orders SET status=? WHERE id=? AND status=?",
+        (STATUS_CANCELLED, order_id, STATUS_PENDING)
+    )
+    db.commit()
+
+
+def mark_order_paid(order_id, stripe_session_id, amount_total):
+    """
+    Marque une commande comme payée, uniquement si Stripe a confirmé le paiement
+    et si la session et le montant correspondent à la commande.
+    Peut être appelée plusieurs fois sans danger (le stock n'est retiré qu'une fois).
+    Retourne True si la commande est payée (ou déjà expédiée).
+    """
+    db = get_db()
+    order = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order or not stripe_session_id or order["stripe_session_id"] != stripe_session_id:
+        return False
+    if amount_total is None or int(amount_total) != to_cents(order["total"]):
+        app.logger.error("Montant Stripe différent de la commande %s", order_id)
+        return False
+    cursor = db.execute(
+        "UPDATE orders SET status=? WHERE id=? AND status IN (?, ?)",
+        (STATUS_PAID, order_id, STATUS_PENDING, STATUS_CANCELLED)
+    )
+    if cursor.rowcount == 1:
+        for line in json.loads(order["items_json"] or "[]"):
+            db.execute(
+                "UPDATE products SET stock = MAX(stock - ?, 0) WHERE id=?",
+                (int(line.get("quantity", 0)), int(line.get("id", 0)))
+            )
+    db.commit()
+    status = db.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()["status"]
+    return status in (STATUS_PAID, STATUS_SHIPPED)
+
+
 @app.route("/commande", methods=["GET", "POST"])
 def checkout():
     items, total, _ = cart_details()
@@ -313,6 +414,7 @@ def checkout():
     initial = {}
     if customer:
         initial = {"name": customer["name"], "email": customer["email"]}
+
     if request.method == "POST":
         fields = ["name", "email", "phone", "address", "postal_code", "city"]
         data = {f: request.form.get(f, "").strip() for f in fields}
@@ -320,6 +422,24 @@ def checkout():
         if not all(data.values()) or "@" not in data["email"]:
             flash("Merci de renseigner tous les champs obligatoires avec une adresse e-mail valide.", "error")
             return render_template("checkout.html", items=items, total=total, form=request.form)
+
+        ready, message = stripe_ready()
+        if not ready:
+            flash(message, "error")
+            return render_template("checkout.html", items=items, total=total, form=request.form)
+
+        for item in items:
+            if item["qty"] > item["product"]["stock"]:
+                flash(f"Stock insuffisant pour « {item['product']['name']} ».", "error")
+                return redirect(url_for("cart"))
+
+        if to_cents(total) < 50:
+            flash("Le montant minimum pour un paiement par carte est de 0,50 €.", "error")
+            return redirect(url_for("cart"))
+
+        # Si le client revient après avoir abandonné un paiement, on annule l'ancienne commande en attente.
+        cancel_pending_order(session.get("pending_order_id"))
+
         item_list = [{
             "id": item["product"]["id"],
             "name": item["product"]["name"],
@@ -327,20 +447,114 @@ def checkout():
             "unit_price": item["product"]["price"],
             "line_total": item["line_total"]
         } for item in items]
+
         db = get_db()
-        db.execute("""INSERT INTO orders
+        cursor = db.execute("""INSERT INTO orders
             (customer_id,customer_name,email,phone,address,postal_code,city,notes,items_json,total,status,created_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (customer["id"] if customer else None, data["name"], data["email"], data["phone"],
              data["address"], data["postal_code"], data["city"], notes,
-             json.dumps(item_list, ensure_ascii=False), total, "À traiter",
+             json.dumps(item_list, ensure_ascii=False), total, STATUS_PENDING,
              datetime.now().isoformat(timespec="minutes")))
         db.commit()
-        order_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-        session["cart"] = {}
-        return render_template("order_success.html", order_id=order_id)
+        order_id = cursor.lastrowid
+
+        # Les montants envoyés à Stripe sont recalculés ici, depuis la base de données.
+        line_items = [{
+            "price_data": {
+                "currency": "eur",
+                "unit_amount": to_cents(item["product"]["price"]),
+                "product_data": {"name": item["product"]["name"]},
+            },
+            "quantity": item["qty"],
+        } for item in items]
+
+        try:
+            checkout_session = stripe.checkout.Session.create(
+                mode="payment",
+                line_items=line_items,
+                client_reference_id=str(order_id),
+                customer_email=data["email"],
+                metadata={"order_id": str(order_id)},
+                locale="fr",
+                success_url=url_for("payment_success", _external=True) + "?session_id={CHECKOUT_SESSION_ID}",
+                cancel_url=url_for("payment_cancelled", _external=True),
+            )
+        except stripe.StripeError:
+            app.logger.exception("Erreur Stripe à la création de la session de paiement")
+            cancel_pending_order(order_id)
+            flash("Le paiement est momentanément indisponible. Réessayez dans quelques instants.", "error")
+            return render_template("checkout.html", items=items, total=total, form=request.form)
+
+        db.execute("UPDATE orders SET stripe_session_id=? WHERE id=?", (checkout_session.id, order_id))
+        db.commit()
+        session["pending_order_id"] = order_id
+        return redirect(checkout_session.url, code=303)
+
     return render_template("checkout.html", items=items, total=total, form=initial)
 
+
+@app.route("/paiement/succes")
+def payment_success():
+    session_id = request.args.get("session_id", "")
+    if not session_id:
+        abort(404)
+    order = get_db().execute(
+        "SELECT * FROM orders WHERE stripe_session_id=?", (session_id,)
+    ).fetchone()
+    if not order:
+        abort(404)
+    try:
+        checkout_session = stripe.checkout.Session.retrieve(session_id)
+    except stripe.StripeError:
+        app.logger.exception("Erreur Stripe à la vérification du paiement")
+        flash("Impossible de vérifier votre paiement pour le moment. Si vous avez été débité, contactez-nous.", "error")
+        return redirect(url_for("shop"))
+
+    if checkout_session.payment_status == "paid":
+        if mark_order_paid(order["id"], checkout_session.id, checkout_session.amount_total):
+            session["cart"] = {}
+            session.pop("pending_order_id", None)
+            return render_template("order_success.html", order_id=order["id"])
+        flash("Le paiement n'a pas pu être rapproché de votre commande. Contactez-nous.", "error")
+        return redirect(url_for("shop"))
+
+    flash("Votre paiement est en cours de vérification. Vous recevrez une confirmation dès qu'il sera validé.", "success")
+    return redirect(url_for("shop"))
+
+
+@app.route("/paiement/annule")
+def payment_cancelled():
+    cancel_pending_order(session.pop("pending_order_id", None))
+    flash("Paiement annulé. Votre panier a été conservé.", "error")
+    return redirect(url_for("cart"))
+
+
+@app.post("/webhook/stripe")
+def stripe_webhook():
+    """Stripe nous prévient ici (signature vérifiée) même si le client ferme son navigateur."""
+    if not STRIPE_WEBHOOK_SECRET:
+        return "Webhook non configuré", 503
+    payload = request.get_data()
+    signature = request.headers.get("Stripe-Signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.SignatureVerificationError):
+        return "Signature invalide", 400
+
+    obj = event.data.object
+    order_id = getattr(obj, "client_reference_id", None)
+    if order_id and event.type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        if getattr(obj, "payment_status", "") == "paid":
+            mark_order_paid(order_id, getattr(obj, "id", None), getattr(obj, "amount_total", None))
+    elif order_id and event.type in ("checkout.session.expired", "checkout.session.async_payment_failed"):
+        cancel_pending_order(order_id)
+    return "", 200
+
+
+# ---------------------------------------------------------------------------
+# Pages d'information
+# ---------------------------------------------------------------------------
 @app.route("/a-propos")
 def about():
     return render_template("about.html")
@@ -361,6 +575,10 @@ def contact():
 def legal():
     return render_template("legal.html")
 
+
+# ---------------------------------------------------------------------------
+# Administration
+# ---------------------------------------------------------------------------
 @app.route("/admin", methods=["GET", "POST"])
 def admin_login():
     if session.get("is_admin"):
@@ -422,7 +640,7 @@ def admin_toggle_product(product_id):
 @admin_required
 def admin_order_status(order_id):
     status = request.form.get("status", "À traiter")
-    allowed = ["À traiter", "Payée", "Expédiée", "Annulée"]
+    allowed = [STATUS_PENDING, "À traiter", STATUS_PAID, STATUS_SHIPPED, STATUS_CANCELLED]
     if status not in allowed:
         abort(400)
     db = get_db()
