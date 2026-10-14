@@ -1,0 +1,29 @@
+MALINOVA MAISON — VERSION AVEC ESPACE CLIENT
+=============================================
+
+Contenu :
+- Inscription client : /inscription
+- Connexion client : /connexion
+- Espace client : /mon-compte
+- Historique des commandes pour les commandes créées quand le client est connecté
+- Administration : /admin
+- Boutique, panier, commande de démonstration et pages de base
+
+IMPORTANT AVANT DE DEPLOYER
+1. Ce paquet remplace les fichiers de l'application. Télécharge/sauvegarde d'abord ton dépôt actuel.
+2. Dans Render > service > Environment, configure :
+   - MALINOVA_SECRET_KEY : une longue clé aléatoire secrète
+   - MALINOVA_ADMIN_PASSWORD : un mot de passe administrateur fort
+   - COOKIE_SECURE : 1 (à utiliser avec HTTPS)
+   - MALINOVA_DB_PATH : si tu disposes d'un stockage persistant monté, indique son chemin complet, par exemple /var/data/malinova.db.
+3. Sur Render Free, le système de fichiers local peut être éphémère. Sans disque/base de données persistante, les comptes, produits et commandes peuvent disparaître lors de certains redéploiements ou remplacements d'instance.
+4. L'application enregistre des commandes de démonstration, mais n'intègre PAS Stripe et ne prélève aucun paiement.
+5. Les nouveaux produits sont masqués par défaut. Vérifie les fournisseurs, les prix, le stock et les obligations légales avant toute vente.
+6. Avant un lancement réel, ajouter une protection CSRF, une limitation des tentatives de connexion, un flux de réinitialisation du mot de passe et vérifier la politique de confidentialité/RGPD.
+7. Ne partage jamais tes mots de passe ou clés secrètes.
+
+Déploiement :
+- Conserver app.py à la racine.
+- Conserver le dossier templates.
+- Build command Render : pip install -r requirements.txt
+- Start command Render : gunicorn app:app

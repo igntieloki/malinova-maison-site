@@ -1,16 +1,32 @@
 import os
 import sqlite3
 import secrets
+import json
 from functools import wraps
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, session, flash, abort, g
+from flask import (
+    Flask, render_template, request, redirect, url_for,
+    session, flash, abort, g
+)
+from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_PATH = os.path.join(BASE_DIR, "malinova.db")
-app = Flask(__name__)
-app.secret_key = os.environ.get("MALINOVA_SECRET_KEY", "change-moi-avec-une-cle-aleatoire-longue")
-ADMIN_PASSWORD = os.environ.get("MALINOVA_ADMIN_PASSWORD", "change-moi-avant-publication")
+DB_PATH = os.environ.get("MALINOVA_DB_PATH", os.path.join(BASE_DIR, "malinova.db"))
 
+app = Flask(__name__)
+app.secret_key = os.environ.get("MALINOVA_SECRET_KEY")
+if not app.secret_key:
+    # Convenience for local testing only. Set MALINOVA_SECRET_KEY in Render before public use.
+    app.secret_key = "LOCAL-TEST-ONLY-" + secrets.token_hex(32)
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1") == "1",
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 14,
+)
+
+ADMIN_PASSWORD = os.environ.get("MALINOVA_ADMIN_PASSWORD", "")
 CATEGORIES = ["Décoration", "Rangement", "Cuisine", "Textiles"]
 
 SEED_PRODUCTS = [
@@ -21,6 +37,9 @@ SEED_PRODUCTS = [
     ("Plateau minimaliste", "Décoration", "Un plateau pratique pour présenter vos objets préférés.", 16.90, "https://images.unsplash.com/photo-1603006905003-be475563bc59?auto=format&fit=crop&w=1000&q=85", 8),
     ("Organiseur malin", "Rangement", "Une solution simple pour garder les petits objets à portée de main.", 12.90, "https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=1000&q=85", 18),
 ]
+
+app.jinja_env.filters['from_json'] = lambda value: json.loads(value or '[]')
+
 
 def get_db():
     if "db" not in g:
@@ -36,7 +55,9 @@ def close_db(error=None):
         db.close()
 
 def init_db():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     db = sqlite3.connect(DB_PATH)
+    db.execute("PRAGMA foreign_keys = ON")
     db.execute("""CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -45,10 +66,18 @@ def init_db():
         price REAL NOT NULL CHECK(price >= 0),
         image_url TEXT NOT NULL DEFAULT '',
         stock INTEGER NOT NULL DEFAULT 0,
-        active INTEGER NOT NULL DEFAULT 1
+        active INTEGER NOT NULL DEFAULT 0
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
     )""")
     db.execute("""CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER,
         customer_name TEXT NOT NULL,
         email TEXT NOT NULL,
         phone TEXT NOT NULL,
@@ -59,12 +88,17 @@ def init_db():
         items_json TEXT NOT NULL,
         total REAL NOT NULL,
         status TEXT NOT NULL DEFAULT 'À traiter',
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE SET NULL
     )""")
+    # Ensure an existing database from the previous version gains the customer_id column.
+    order_columns = {row[1] for row in db.execute("PRAGMA table_info(orders)").fetchall()}
+    if "customer_id" not in order_columns:
+        db.execute("ALTER TABLE orders ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
     count = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
     if count == 0:
         db.executemany(
-            "INSERT INTO products (name, category, description, price, image_url, stock) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO products (name, category, description, price, image_url, stock, active) VALUES (?, ?, ?, ?, ?, ?, 0)",
             SEED_PRODUCTS
         )
     db.commit()
@@ -77,6 +111,15 @@ def admin_required(fn):
     def wrapper(*args, **kwargs):
         if not session.get("is_admin"):
             return redirect(url_for("admin_login", next=request.path))
+        return fn(*args, **kwargs)
+    return wrapper
+
+def customer_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("customer_id"):
+            flash("Connectez-vous pour accéder à votre espace client.", "error")
+            return redirect(url_for("login", next=request.path))
         return fn(*args, **kwargs)
     return wrapper
 
@@ -101,12 +144,20 @@ def cart_details():
 @app.context_processor
 def inject_globals():
     _, _, cart_count = cart_details()
-    return {"cart_count": cart_count, "shop_name": "Malinova Maison", "current_year": datetime.now().year}
+    return {
+        "cart_count": cart_count,
+        "shop_name": "Malinova Maison",
+        "current_year": datetime.now().year,
+        "customer_logged_in": bool(session.get("customer_id")),
+        "customer_name": session.get("customer_name", ""),
+        "is_admin": bool(session.get("is_admin")),
+    }
 
 @app.route("/")
 def index():
-    db = get_db()
-    products = db.execute("SELECT * FROM products WHERE active=1 ORDER BY id DESC LIMIT 6").fetchall()
+    products = get_db().execute(
+        "SELECT * FROM products WHERE active=1 ORDER BY id DESC LIMIT 6"
+    ).fetchall()
     return render_template("index.html", products=products)
 
 @app.route("/boutique")
@@ -137,10 +188,9 @@ def add_to_cart(product_id):
     product = get_db().execute("SELECT * FROM products WHERE id=? AND active=1", (product_id,)).fetchone()
     if not product:
         abort(404)
-    qty = request.form.get("qty", "1")
     try:
-        qty = max(1, min(99, int(qty)))
-    except ValueError:
+        qty = max(1, min(99, int(request.form.get("qty", "1"))))
+    except (ValueError, TypeError):
         qty = 1
     cart = session.get("cart", {})
     cart[str(product_id)] = min(99, int(cart.get(str(product_id), 0)) + qty)
@@ -169,12 +219,98 @@ def update_cart():
     flash("Panier mis à jour.", "success")
     return redirect(url_for("cart"))
 
+@app.route("/inscription", methods=["GET", "POST"])
+def register():
+    if session.get("customer_id"):
+        return redirect(url_for("account"))
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        confirm = request.form.get("confirm_password", "")
+        if not name or len(name) > 100 or "@" not in email or len(email) > 254:
+            flash("Vérifiez votre nom et votre adresse e-mail.", "error")
+        elif len(password) < 10:
+            flash("Choisissez un mot de passe d'au moins 10 caractères.", "error")
+        elif password != confirm:
+            flash("Les deux mots de passe ne correspondent pas.", "error")
+        else:
+            try:
+                db = get_db()
+                cursor = db.execute(
+                    "INSERT INTO customers (name,email,password_hash,created_at) VALUES (?,?,?,?)",
+                    (name, email, generate_password_hash(password), datetime.now().isoformat(timespec="minutes"))
+                )
+                db.commit()
+                session.clear()
+                session["customer_id"] = cursor.lastrowid
+                session["customer_name"] = name
+                session.permanent = True
+                flash("Votre compte a été créé. Bienvenue chez Malinova Maison !", "success")
+                return redirect(url_for("account"))
+            except sqlite3.IntegrityError:
+                flash("Un compte existe déjà avec cette adresse e-mail.", "error")
+    return render_template("register.html")
+
+@app.route("/connexion", methods=["GET", "POST"])
+def login():
+    if session.get("customer_id"):
+        return redirect(url_for("account"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        customer = get_db().execute(
+            "SELECT * FROM customers WHERE email=? COLLATE NOCASE", (email,)
+        ).fetchone()
+        if customer and check_password_hash(customer["password_hash"], password):
+            session.clear()
+            session["customer_id"] = customer["id"]
+            session["customer_name"] = customer["name"]
+            session.permanent = True
+            flash("Vous êtes connecté.", "success")
+            next_url = request.args.get("next", "")
+            if next_url.startswith("/") and not next_url.startswith("//"):
+                return redirect(next_url)
+            return redirect(url_for("account"))
+        flash("Adresse e-mail ou mot de passe incorrect.", "error")
+    return render_template("login.html")
+
+@app.post("/deconnexion")
+def customer_logout():
+    session.clear()
+    flash("Vous êtes déconnecté.", "success")
+    return redirect(url_for("index"))
+
+@app.route("/mon-compte")
+@customer_required
+def account():
+    customer = get_db().execute(
+        "SELECT id,name,email,created_at FROM customers WHERE id=?",
+        (session["customer_id"],)
+    ).fetchone()
+    if not customer:
+        session.clear()
+        return redirect(url_for("login"))
+    orders = get_db().execute(
+        "SELECT id,total,status,created_at,items_json FROM orders WHERE customer_id=? ORDER BY id DESC",
+        (customer["id"],)
+    ).fetchall()
+    return render_template("account.html", customer=customer, orders=orders)
+
 @app.route("/commande", methods=["GET", "POST"])
 def checkout():
     items, total, _ = cart_details()
     if not items:
         flash("Votre panier est vide.", "error")
         return redirect(url_for("shop"))
+    customer = None
+    if session.get("customer_id"):
+        customer = get_db().execute(
+            "SELECT * FROM customers WHERE id=?", (session["customer_id"],)
+        ).fetchone()
+    initial = {}
+    if customer:
+        initial = {"name": customer["name"], "email": customer["email"]}
     if request.method == "POST":
         fields = ["name", "email", "phone", "address", "postal_code", "city"]
         data = {f: request.form.get(f, "").strip() for f in fields}
@@ -191,15 +327,17 @@ def checkout():
         } for item in items]
         db = get_db()
         db.execute("""INSERT INTO orders
-            (customer_name,email,phone,address,postal_code,city,notes,items_json,total,status,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (data["name"], data["email"], data["phone"], data["address"], data["postal_code"],
-             data["city"], notes, __import__("json").dumps(item_list, ensure_ascii=False),
-             total, "À traiter", datetime.now().isoformat(timespec="minutes")))
+            (customer_id,customer_name,email,phone,address,postal_code,city,notes,items_json,total,status,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (customer["id"] if customer else None, data["name"], data["email"], data["phone"],
+             data["address"], data["postal_code"], data["city"], notes,
+             json.dumps(item_list, ensure_ascii=False), total, "À traiter",
+             datetime.now().isoformat(timespec="minutes")))
         db.commit()
+        order_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
         session["cart"] = {}
-        return render_template("order_success.html", order_id=db.execute("SELECT last_insert_rowid()").fetchone()[0])
-    return render_template("checkout.html", items=items, total=total, form={})
+        return render_template("order_success.html", order_id=order_id)
+    return render_template("checkout.html", items=items, total=total, form=initial)
 
 @app.route("/a-propos")
 def about():
@@ -212,7 +350,6 @@ def contact():
         email = request.form.get("email", "").strip()
         message = request.form.get("message", "").strip()
         if name and "@" in email and message:
-            # Démo : le message n'est pas envoyé par e-mail. Branchez un service mail avant publication.
             flash("Merci pour votre message. Le formulaire de démonstration a bien été validé, mais aucun e-mail n'est envoyé pour le moment.", "success")
             return redirect(url_for("contact"))
         flash("Merci de remplir tous les champs correctement.", "error")
@@ -228,13 +365,14 @@ def admin_login():
         return redirect(url_for("admin_dashboard"))
     if request.method == "POST":
         password = request.form.get("password", "")
-        if secrets.compare_digest(password, ADMIN_PASSWORD):
+        if ADMIN_PASSWORD and secrets.compare_digest(password, ADMIN_PASSWORD):
             session["is_admin"] = True
+            session.permanent = True
             return redirect(url_for("admin_dashboard"))
-        flash("Mot de passe incorrect.", "error")
+        flash("Mot de passe incorrect. Vérifiez que MALINOVA_ADMIN_PASSWORD est configuré sur Render.", "error")
     return render_template("admin_login.html")
 
-@app.route("/admin/deconnexion", methods=["POST"])
+@app.post("/admin/deconnexion")
 def admin_logout():
     session.pop("is_admin", None)
     return redirect(url_for("index"))
@@ -245,9 +383,10 @@ def admin_dashboard():
     db = get_db()
     products = db.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
     orders = db.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 100").fetchall()
-    return render_template("admin.html", products=products, orders=orders)
+    customers = db.execute("SELECT id,name,email,created_at FROM customers ORDER BY id DESC LIMIT 100").fetchall()
+    return render_template("admin.html", products=products, orders=orders, customers=customers)
 
-@app.route("/admin/produit/ajouter", methods=["POST"])
+@app.post("/admin/produit/ajouter")
 @admin_required
 def admin_add_product():
     try:
@@ -260,11 +399,11 @@ def admin_add_product():
         if not name or not description or price < 0 or category not in CATEGORIES:
             raise ValueError()
         get_db().execute(
-            "INSERT INTO products (name,category,description,price,image_url,stock) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO products (name,category,description,price,image_url,stock,active) VALUES (?,?,?,?,?,?,0)",
             (name, category, description, price, image_url, stock)
         )
         get_db().commit()
-        flash("Produit ajouté.", "success")
+        flash("Produit ajouté et gardé masqué pour le moment.", "success")
     except (ValueError, TypeError):
         flash("Vérifie les champs du produit.", "error")
     return redirect(url_for("admin_dashboard"))

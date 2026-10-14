@@ -1,0 +1,6 @@
+{% extends "base.html" %}{% block title %}Connexion — Malinova Maison{% endblock %}{% block content %}
+<section class="panel form-card"><div class="eyebrow">Ravi de vous retrouver</div><h1>Connexion</h1><p class="muted">Connectez-vous à votre espace client.</p><form method="post">
+<div class="field"><label for="email">Adresse e-mail</label><input id="email" type="email" name="email" autocomplete="email" required value="{{ request.form.get('email','') }}"></div>
+<div class="field"><label for="password">Mot de passe</label><input id="password" type="password" name="password" autocomplete="current-password" required></div>
+<button type="submit">Se connecter</button></form><p class="form-note">Pas encore de compte ? <a href="{{ url_for('register') }}"><strong>Créer un compte</strong></a></p></section>
+{% endblock %}
