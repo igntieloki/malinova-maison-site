@@ -1,25 +1,17 @@
 import os
 import sqlite3
-import secrets
-from functools import wraps
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, session, flash, abort, g
+from flask import Flask, render_template, request, redirect, url_for, g
 import stripe
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, "malinova.db")
 app = Flask(__name__)
-app.secret_key = os.environ.get("MALINOVA_SECRET_KEY", "change-moi-avec-une-cle-aleatoire-longue")
-ADMIN_PASSWORD = os.environ.get("MALINOVA_ADMIN_PASSWORD", "change-moi-avant-publication")
+app.secret_key = os.environ.get("MALINOVA_SECRET_KEY", "cle-secrete-par-defaut")
 
-CATEGORIES = ["Décoration", "Rangement", "Cuisine", "Textiles"]
-
+# Configuration de la base de données et produits initiaux
 SEED_PRODUCTS = [
     ("Vase Alba", "Décoration", "Vase décoratif aux lignes douces pour une ambiance naturelle.", 24.90, "https://images.unsplash.com/photo-1581783898377-1c85bf937427?auto=format&fit=crop&w=600&q=80"),
     ("Panier naturel", "Rangement", "Un panier polyvalent pour organiser plaids, accessoires ou petits objets.", 17.50, "https://images.unsplash.com/photo-1615874959474-d609969a20ed?auto=format&fit=crop&w=600&q=80"),
-    ("Bocaux de cuisine", "Cuisine", "Des bocaux sobres pour garder vos ingrédients bien organisés.", 19.90, "https://images.unsplash.com/photo-1584744982491-6635dd49dd5b?auto=format&fit=crop&w=600&q=80"),
-    ("Coussin doux", "Textiles", "Un coussin décoratif pour ajouter une touche chaleureuse à votre intérieur.", 22.00, "https://images.unsplash.com/photo-1584100936595-c0654b55a2e2?auto=format&fit=crop&w=600&q=80"),
-    ("Plateau minimaliste", "Décoration", "Un plateau pratique pour présenter vos objets préférés.", 16.90, "https://images.unsplash.com/photo-1532323544230-7191fd51bc1b?auto=format&fit=crop&w=600&q=80"),
 ]
 
 def get_db():
@@ -49,8 +41,7 @@ def init_db():
             )
         ''')
         cursor = db.execute('SELECT COUNT(*) FROM products')
-        count = cursor.fetchone()[0]
-        if count == 0:
+        if cursor.fetchone()[0] == 0:
             db.executemany(
                 'INSERT INTO products (name, category, description, price, image_url) VALUES (?, ?, ?, ?, ?)',
                 SEED_PRODUCTS
@@ -72,7 +63,7 @@ def index():
 def panier():
     return render_template('panier.html')
 
-# --- ROUTE DE PAIEMENT STRIPE ---
+# --- ROUTE DE PAIEMENT STRIPE CHECKOUT ---
 @app.route('/creer-paiement', methods=['POST'])
 def creer_paiement():
     try:
@@ -84,7 +75,7 @@ def creer_paiement():
                     'product_data': {
                         'name': 'Commande - Malinova Maison',
                     },
-                    'unit_amount': 2900,  # Montant en centimes (29.00 €)
+                    'unit_amount': 2900,  # 29,00 € en centimes
                 },
                 'quantity': 1,
             }],
@@ -94,11 +85,18 @@ def creer_paiement():
         )
         return redirect(checkout_session.url, code=303)
     except Exception as e:
-        return str(e), 400
+        return f"Erreur Stripe : {str(e)}", 400
 
 @app.route('/paiement-succes')
 def paiement_succes():
-    return "<h1>Paiement réussi ! Merci pour votre achat chez Malinova Maison.</h1>"
+    return """
+    <div style="text-align:center; padding:50px; font-family:sans-serif;">
+        <h1 style="color:green;">🎉 Paiement réussi !</h1>
+        <p>Merci pour votre achat chez Malinova Maison.</p>
+        <a href="/">Retourner à l'accueil</a>
+    </div>
+    """
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
